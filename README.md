@@ -535,10 +535,6 @@ smtp-eva/
 - **Documentation**: Update README and JSDoc comments
 - **Logging**: Use structured logging for debugging
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## 🆘 Support
 
 - **Documentation**: [API Docs](http://localhost:3000/api/email/docs)
