@@ -535,29 +535,6 @@ smtp-eva/
 - **Documentation**: Update README and JSDoc comments
 - **Logging**: Use structured logging for debugging
 
-## 🆘 Support
-
-- **Documentation**: [API Docs](http://localhost:3000/api/email/docs)
-- **Issues**: [GitHub Issues](https://github.com/your-username/smtp-eva/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/smtp-eva/discussions)
-
-## 🎯 Roadmap
-
-### Upcoming Features
-- [ ] **Machine Learning** spam trap detection
-- [ ] **Webhook support** for async processing
-- [ ] **Email deliverability scoring** with ISP insights
-- [ ] **Geographic validation** and regional compliance
-- [ ] **Integration APIs** for popular CRM systems
-- [ ] **Real-time monitoring** dashboard
-- [ ] **Advanced analytics** and reporting
-
-### Performance Improvements
-- [ ] **Redis caching** for DNS and MX records
-- [ ] **Connection pooling** for SMTP validation
-- [ ] **Distributed processing** for large batches
-- [ ] **CDN integration** for global performance
-
 ---
 
 <div align="center">
