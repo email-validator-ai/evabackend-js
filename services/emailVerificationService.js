@@ -5,7 +5,7 @@ const punycode = require('punycode/');
 const logger = require('../utils/logger');
 const SyntaxValidator = require('./syntaxValidator');
 const DNSValidator = require('./dnsValidator');
-const SMTPValidator = require('./smtpValidator');
+const ExternalSMTPService = require('./externalSMTPService');
 const DisposableEmailDetector = require('./disposableEmailDetector');
 const RoleAccountDetector = require('./roleAccountDetector');
 const FreeEmailDetector = require('./freeEmailDetector');
@@ -15,7 +15,7 @@ class EmailVerificationService {
   constructor() {
     this.syntaxValidator = new SyntaxValidator();
     this.dnsValidator = new DNSValidator();
-    this.smtpValidator = new SMTPValidator();
+    this.externalSMTPService = new ExternalSMTPService();
     this.disposableEmailDetector = new DisposableEmailDetector();
     this.roleAccountDetector = new RoleAccountDetector();
     this.freeEmailDetector = new FreeEmailDetector();
@@ -23,7 +23,7 @@ class EmailVerificationService {
   }
 
   /**
-   * Comprehensive email verification
+   * Comprehensive email verification with external SMTP service
    * @param {string} email - Email address to verify
    * @param {Object} options - Verification options
    * @returns {Object} Verification result
@@ -54,7 +54,7 @@ class EmailVerificationService {
       const domain = normalizedEmail.split('@')[1];
       const localPart = normalizedEmail.split('@')[0];
 
-      // 1. Advanced Syntax Verification
+      // Level 1: Advanced Syntax Verification
       logger.info(`Starting syntax verification for: ${email}`);
       result.checks.syntax = await this.syntaxValidator.validate(normalizedEmail);
 
@@ -63,45 +63,78 @@ class EmailVerificationService {
         return result;
       }
 
-      // 2. International Domain Support
+      // Level 2: International Domain Support
       result.checks.international = this.checkInternationalSupport(domain);
 
-      // 3. Domain and DNS Check
+      // Level 3: Domain and DNS Check
       if (options.checkDNS !== false) {
         logger.info(`Starting DNS verification for domain: ${domain}`);
         result.checks.dns = await this.dnsValidator.validateDomain(domain);
       }
 
-      // 4. MX Record Check
+      // Level 4: MX Record Check
       if (options.checkMX !== false && result.checks.dns?.isValid) {
         logger.info(`Starting MX verification for domain: ${domain}`);
         result.checks.mx = await this.dnsValidator.validateMX(domain);
       }
 
-      // 5. Disposable Email Detection
+      // Level 4: Disposable Email Detection
       result.checks.disposable = await this.disposableEmailDetector.isDisposable(domain);
 
-      // 6. Role Account Detection
+      // Level 4: Role Account Detection
       result.checks.role = this.roleAccountDetector.isRoleAccount(localPart);
 
-      // 7. Free Email Detection
+      // Level 4: Free Email Detection
       result.checks.free = this.freeEmailDetector.isFreeEmail(domain);
 
-      // 8. Spam Trap Detection
+      // Level 4: Spam Trap Detection
       result.checks.spamTrap = await this.spamTrapDetector.isSpamTrap(normalizedEmail);
 
-      // 9. SMTP Mailbox Verification
+      // Level 5: External SMTP Mailbox Verification
       if (options.checkSMTP !== false && result.checks.mx?.isValid && !result.checks.disposable.isDisposable) {
-        logger.info(`Starting SMTP verification for: ${email}`);
-        result.checks.smtp = await this.smtpValidator.validateMailbox(normalizedEmail, result.checks.mx.mxRecords);
+        logger.info(`Starting external SMTP verification for: ${email}`);
+        try {
+          result.checks.smtp = await this.externalSMTPService.validateEmail(
+            normalizedEmail, 
+            result.checks.mx.mxRecords,
+            options
+          );
+        } catch (error) {
+          logger.error(`External SMTP verification failed for ${email}:`, error);
+          result.checks.smtp = {
+            isValid: false,
+            isDeliverable: false,
+            smtpResponse: '',
+            responseCode: null,
+            errors: [`External SMTP service error: ${error.message}`],
+            warnings: ['SMTP validation could not be completed'],
+            testedMX: null,
+            connectionStatus: 'external_service_failed'
+          };
+        }
       }
 
-      // 10. Catch-all Detection
+      // Level 5: Catch-all Detection (via external service)
       if (result.checks.smtp && options.checkCatchAll !== false) {
-        result.checks.catchAll = await this.smtpValidator.detectCatchAll(domain, result.checks.mx.mxRecords);
+        try {
+          result.checks.catchAll = await this.externalSMTPService.detectCatchAll(
+            domain, 
+            result.checks.mx.mxRecords,
+            options
+          );
+        } catch (error) {
+          logger.error(`External catch-all detection failed for ${domain}:`, error);
+          result.checks.catchAll = {
+            isCatchAll: false,
+            confidence: 0,
+            testResults: [],
+            errors: [`External SMTP service error: ${error.message}`],
+            warnings: ['Catch-all detection could not be completed']
+          };
+        }
       }
 
-      // 11. Yahoo Specific Verification
+      // Special handling for Yahoo domains (Level 4)
       if (this.isYahooDomain(domain)) {
         result.checks.yahoo = await this.verifyYahooEmail(normalizedEmail);
       }
@@ -129,7 +162,7 @@ class EmailVerificationService {
   }
 
   /**
-   * Batch email verification
+   * Batch email verification with external SMTP service
    * @param {Array} emails - Array of email addresses
    * @param {Object} options - Verification options
    * @returns {Array} Array of verification results
@@ -137,11 +170,39 @@ class EmailVerificationService {
   async verifyEmailBatch(emails, options = {}) {
     const maxConcurrent = options.maxConcurrent || 10;
     const results = [];
+    const smtpBatchVerifications = []; // For emails that pass levels 1-4
     
-    // Process emails in batches
+    logger.info(`Starting batch verification for ${emails.length} emails`);
+
+    // Process emails in batches for levels 1-4
     for (let i = 0; i < emails.length; i += maxConcurrent) {
       const batch = emails.slice(i, i + maxConcurrent);
-      const batchPromises = batch.map(email => this.verifyEmail(email, options));
+      const batchPromises = batch.map(async (email) => {
+        try {
+          // Run levels 1-4 verification
+          const partialResult = await this.verifyEmail(email, { 
+            ...options, 
+            checkSMTP: false, // Skip SMTP for now
+            checkCatchAll: false 
+          });
+          
+          // If email passes levels 1-4 and SMTP check is enabled, prepare for external SMTP
+          if (partialResult.checks.mx?.isValid && 
+              !partialResult.checks.disposable?.isDisposable && 
+              options.checkSMTP !== false) {
+            smtpBatchVerifications.push({
+              email: partialResult.email,
+              mxRecords: partialResult.checks.mx.mxRecords,
+              result: partialResult
+            });
+          }
+          
+          return partialResult;
+        } catch (error) {
+          logger.error('Batch verification error:', error);
+          return this.createErrorResult('Batch processing failed', email);
+        }
+      });
       
       try {
         const batchResults = await Promise.all(batchPromises);
@@ -155,6 +216,57 @@ class EmailVerificationService {
       }
     }
 
+    // Now process SMTP verification in batch via external service
+    if (smtpBatchVerifications.length > 0 && options.checkSMTP !== false) {
+      try {
+        logger.info(`Sending batch SMTP verification for ${smtpBatchVerifications.length} emails to external server`);
+        
+        const smtpBatchResult = await this.externalSMTPService.validateEmailBatch(
+          smtpBatchVerifications.map(v => ({
+            email: v.email,
+            mxRecords: v.mxRecords
+          })),
+          options
+        );
+
+        // Merge SMTP results back into main results
+        if (smtpBatchResult.results) {
+          const smtpResultsMap = new Map();
+          smtpBatchResult.results.forEach(smtpResult => {
+            smtpResultsMap.set(smtpResult.email, smtpResult.smtp);
+          });
+
+          // Update results with SMTP data
+          results.forEach(result => {
+            const smtpData = smtpResultsMap.get(result.email);
+            if (smtpData) {
+              result.checks.smtp = smtpData;
+              
+              // Recalculate overall result with SMTP data
+              this.calculateOverallResult(result);
+            }
+          });
+        }
+
+      } catch (error) {
+        logger.error('Batch SMTP verification failed:', error);
+        // Add error SMTP results for all pending verifications
+        smtpBatchVerifications.forEach(verification => {
+          const result = results.find(r => r.email === verification.email);
+          if (result) {
+            result.checks.smtp = {
+              isValid: false,
+              isDeliverable: false,
+              errors: [`External SMTP service error: ${error.message}`],
+              connectionStatus: 'external_service_failed'
+            };
+            this.calculateOverallResult(result);
+          }
+        });
+      }
+    }
+
+    logger.info(`Batch verification completed for ${emails.length} emails`);
     return results;
   }
 
