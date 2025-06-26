@@ -17,7 +17,7 @@ const emailValidationSchema = Joi.object({
 });
 
 const batchValidationSchema = Joi.object({
-  emails: Joi.array().items(Joi.string().email()).min(1).max(1000).required(),
+  emails: Joi.array().items(Joi.string()).min(1).max(1000).required(),
   checkDNS: Joi.boolean().default(true),
   checkMX: Joi.boolean().default(true),
   checkSMTP: Joi.boolean().default(false), // Default false for batch to avoid overwhelming
