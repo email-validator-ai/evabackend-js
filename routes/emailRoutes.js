@@ -3,6 +3,14 @@ const router = express.Router();
 const Joi = require('joi');
 const EmailVerificationService = require('../services/emailVerificationService');
 const logger = require('../utils/logger');
+const multer = require('multer');
+const csv = require('csv-parser');
+const createCsvWriter = require('csv-writer').createObjectCsvWriter;
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { Worker } = require('worker_threads');
+const stream = require('stream');
 
 // Initialize email verification service
 const emailVerificationService = new EmailVerificationService();
@@ -519,6 +527,373 @@ router.get('/stats', (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error'
+    });
+  }
+});
+
+/**
+ * @route POST /api/email/validate-csv
+ * @desc Upload and validate CSV file with parallel processing
+ * @access Public
+ */
+
+// Configure multer for CSV file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 200 * 1024 * 1024 // 200MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'));
+    }
+  }
+});
+
+router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No CSV file uploaded'
+      });
+    }
+
+    logger.info(`Processing CSV file: ${req.file.originalname}, Size: ${req.file.size} bytes`);
+
+    // Parse CSV from buffer
+    const csvData = [];
+    const csvStream = new stream.Readable();
+    csvStream.push(req.file.buffer);
+    csvStream.push(null);
+
+    await new Promise((resolve, reject) => {
+      csvStream
+        .pipe(csv())
+        .on('data', (row) => {
+          csvData.push(row);
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    if (csvData.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'CSV file is empty or invalid'
+      });
+    }
+
+    logger.info(`Parsed ${csvData.length} rows from CSV`);
+
+    // Check if Email column exists
+    const firstRow = csvData[0];
+    if (!firstRow.hasOwnProperty('Email')) {
+      return res.status(400).json({
+        success: false,
+        error: 'CSV must contain an "Email" column'
+      });
+    }
+
+    // Create temporary directory for output files
+    const tempDir = path.join(os.tmpdir(), 'email-validation-' + Date.now());
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    // Get original columns from the first row
+    const originalColumns = Object.keys(firstRow);
+    
+    // Create CSV file paths
+    const validCsvPath = path.join(tempDir, 'valid_emails.csv');
+    const invalidCsvPath = path.join(tempDir, 'invalid_emails.csv');
+    const progressPath = path.join(tempDir, 'progress.json');
+
+    // Initialize CSV writers with headers
+    const validCsvWriter = createCsvWriter({
+      path: validCsvPath,
+      header: originalColumns.map(col => ({ id: col, title: col }))
+    });
+
+    const invalidColumns = [...originalColumns, 'Rejection_Reasons'];
+    const invalidCsvWriter = createCsvWriter({
+      path: invalidCsvPath,
+      header: invalidColumns.map(col => ({ id: col, title: col }))
+    });
+
+    // Write headers immediately
+    await validCsvWriter.writeRecords([]);
+    await invalidCsvWriter.writeRecords([]);
+
+    // Initialize counters and progress tracking
+    let validCount = 0;
+    let invalidCount = 0;
+    let processedCount = 0;
+    const totalCount = csvData.length;
+    const batchSize = 50; // Save progress every 50 emails
+    const startTime = Date.now();
+
+    logger.info(`Starting sequential processing of ${totalCount} emails`);
+
+    // Process emails sequentially
+    for (let i = 0; i < csvData.length; i++) {
+      try {
+        const emailData = csvData[i];
+        const email = emailData.Email;
+        
+        if (!email || typeof email !== 'string') {
+          // Invalid email format - add to invalid file immediately
+          const invalidRecord = {};
+          originalColumns.forEach(col => {
+            invalidRecord[col] = emailData[col] || '';
+          });
+          invalidRecord.Rejection_Reasons = 'Missing or invalid email format';
+          
+          await invalidCsvWriter.writeRecords([invalidRecord]);
+          invalidCount++;
+        } else {
+          // Perform validation (excluding SMTP)
+          const validationResult = await emailVerificationService.verifyEmail(email, {
+            checkDNS: true,
+            checkMX: true,
+            checkSMTP: false, // Exclude SMTP as requested
+            checkCatchAll: true
+          });
+
+          // Extract validation reasons from the result
+          const reasons = [];
+          if (!validationResult.isValid) {
+            if (validationResult.errors && validationResult.errors.length > 0) {
+              reasons.push(...validationResult.errors);
+            }
+            if (validationResult.checks) {
+              // Check syntax validation
+              if (validationResult.checks.syntax && !validationResult.checks.syntax.isValid) {
+                reasons.push('Invalid email syntax');
+              }
+              // Check DNS validation
+              if (validationResult.checks.dns && !validationResult.checks.dns.isValid) {
+                reasons.push('Domain does not exist');
+              }
+              // Check MX validation
+              if (validationResult.checks.mx && !validationResult.checks.mx.isValid) {
+                reasons.push('No mail servers found for domain');
+              }
+              // Check disposable email
+              if (validationResult.checks.disposable && validationResult.checks.disposable.isDisposable) {
+                reasons.push('Disposable/temporary email address');
+              }
+              // Check role account
+              if (validationResult.checks.role && validationResult.checks.role.isRole) {
+                reasons.push('Role-based email address');
+              }
+            }
+            if (reasons.length === 0) {
+              reasons.push('Email validation failed');
+            }
+          }
+
+          // Prepare record with original columns
+          const record = {};
+          originalColumns.forEach(col => {
+            record[col] = emailData[col] || '';
+          });
+
+          if (validationResult.isValid) {
+            // Write to valid file immediately
+            await validCsvWriter.writeRecords([record]);
+            validCount++;
+          } else {
+            // Write to invalid file with reasons immediately
+            record.Rejection_Reasons = reasons.join('; ');
+            await invalidCsvWriter.writeRecords([record]);
+            invalidCount++;
+          }
+        }
+
+        processedCount++;
+
+        // Log progress and save progress file every batch
+        if (processedCount % batchSize === 0 || processedCount === totalCount) {
+          const progress = {
+            processedCount,
+            totalCount,
+            validCount,
+            invalidCount,
+            percentage: ((processedCount / totalCount) * 100).toFixed(2),
+            elapsedTime: Date.now() - startTime,
+            estimatedTimeRemaining: processedCount > 0 ? 
+              Math.round(((Date.now() - startTime) / processedCount) * (totalCount - processedCount)) : 0,
+            lastUpdated: new Date().toISOString()
+          };
+
+          // Save progress to file
+          fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
+          
+          logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount}`);
+        }
+
+      } catch (error) {
+        // Handle individual email processing errors
+        logger.error(`Error processing email ${i + 1}:`, error);
+        
+        const emailData = csvData[i];
+        const invalidRecord = {};
+        originalColumns.forEach(col => {
+          invalidRecord[col] = emailData[col] || '';
+        });
+        invalidRecord.Rejection_Reasons = `Processing error: ${error.message}`;
+        
+        await invalidCsvWriter.writeRecords([invalidRecord]);
+        invalidCount++;
+        processedCount++;
+      }
+    }
+
+    logger.info(`Sequential processing complete: ${validCount} valid, ${invalidCount} invalid`);
+
+    // Final progress update
+    const finalProgress = {
+      processedCount: totalCount,
+      totalCount,
+      validCount,
+      invalidCount,
+      percentage: 100,
+      elapsedTime: Date.now() - startTime,
+      completed: true,
+      completedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(progressPath, JSON.stringify(finalProgress, null, 2));
+
+    // Send response with download links
+    res.json({
+      success: true,
+      message: 'CSV validation completed',
+      summary: {
+        totalProcessed: processedCount,
+        validEmails: validCount,
+        invalidEmails: invalidCount,
+        processingTime: Date.now() - startTime
+      },
+      downloadLinks: {
+        validEmails: validCount > 0 ? `/api/email/download/${path.basename(tempDir)}/valid_emails.csv` : null,
+        invalidEmails: invalidCount > 0 ? `/api/email/download/${path.basename(tempDir)}/invalid_emails.csv` : null,
+        progress: `/api/email/download/${path.basename(tempDir)}/progress.json`
+      },
+      tempId: path.basename(tempDir)
+    });
+
+    // Clean up temp files after 1 hour
+    setTimeout(() => {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        logger.info(`Cleaned up temporary files: ${tempDir}`);
+      } catch (error) {
+        logger.error('Error cleaning up temp files:', error);
+      }
+    }, 60 * 60 * 1000); // 1 hour
+
+  } catch (error) {
+    logger.error('CSV validation failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * @route GET /api/email/download/:tempId/:filename
+ * @desc Download processed CSV files
+ * @access Public
+ */
+router.get('/download/:tempId/:filename', (req, res) => {
+  try {
+    const { tempId, filename } = req.params;
+    const filePath = path.join(os.tmpdir(), tempId, filename);
+
+    // Validate file exists and is safe
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'File not found or expired'
+      });
+    }
+
+    // Validate filename to prevent directory traversal
+    if (!['valid_emails.csv', 'invalid_emails.csv', 'progress.json'].includes(filename)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid filename'
+      });
+    }
+
+    // Set appropriate headers based on file type
+    if (filename.endsWith('.json')) {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    } else {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    }
+    
+    // Stream the file
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+
+    fileStream.on('error', (error) => {
+      logger.error('Error streaming file:', error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error: 'Error downloading file'
+        });
+      }
+    });
+
+  } catch (error) {
+    logger.error('Download failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * @route GET /api/email/progress/:tempId
+ * @desc Get real-time progress of CSV processing
+ * @access Public
+ */
+router.get('/progress/:tempId', (req, res) => {
+  try {
+    const { tempId } = req.params;
+    const progressPath = path.join(os.tmpdir(), tempId, 'progress.json');
+
+    // Check if progress file exists
+    if (!fs.existsSync(progressPath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Progress file not found or processing not started'
+      });
+    }
+
+    // Read and return progress data
+    const progressData = JSON.parse(fs.readFileSync(progressPath, 'utf8'));
+    
+    res.json({
+      success: true,
+      data: progressData
+    });
+
+  } catch (error) {
+    logger.error('Error reading progress:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Error reading progress data',
+      message: error.message
     });
   }
 });
