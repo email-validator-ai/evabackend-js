@@ -635,152 +635,175 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
 
     logger.info(`Starting sequential processing of ${totalCount} emails`);
 
-    // Process emails sequentially
-    for (let i = 0; i < csvData.length; i++) {
-      try {
-        const emailData = csvData[i];
-        const email = emailData.Email;
-        
-        if (!email || typeof email !== 'string') {
-          // Invalid email format - add to invalid file immediately
-          const invalidRecord = {};
-          originalColumns.forEach(col => {
-            invalidRecord[col] = emailData[col] || '';
-          });
-          invalidRecord.Rejection_Reasons = 'Missing or invalid email format';
-          
-          await invalidCsvWriter.writeRecords([invalidRecord]);
-          invalidCount++;
-        } else {
-          // Perform validation (excluding SMTP)
-          const validationResult = await emailVerificationService.verifyEmail(email, {
-            checkDNS: true,
-            checkMX: true,
-            checkSMTP: false, // Exclude SMTP as requested
-            checkCatchAll: true
-          });
-
-          // Extract validation reasons from the result
-          const reasons = [];
-          if (!validationResult.isValid) {
-            if (validationResult.errors && validationResult.errors.length > 0) {
-              reasons.push(...validationResult.errors);
-            }
-            if (validationResult.checks) {
-              // Check syntax validation
-              if (validationResult.checks.syntax && !validationResult.checks.syntax.isValid) {
-                reasons.push('Invalid email syntax');
-              }
-              // Check DNS validation
-              if (validationResult.checks.dns && !validationResult.checks.dns.isValid) {
-                reasons.push('Domain does not exist');
-              }
-              // Check MX validation
-              if (validationResult.checks.mx && !validationResult.checks.mx.isValid) {
-                reasons.push('No mail servers found for domain');
-              }
-              // Check disposable email
-              if (validationResult.checks.disposable && validationResult.checks.disposable.isDisposable) {
-                reasons.push('Disposable/temporary email address');
-              }
-              // Check role account
-              if (validationResult.checks.role && validationResult.checks.role.isRole) {
-                reasons.push('Role-based email address');
-              }
-            }
-            if (reasons.length === 0) {
-              reasons.push('Email validation failed');
-            }
-          }
-
-          // Prepare record with original columns
-          const record = {};
-          originalColumns.forEach(col => {
-            record[col] = emailData[col] || '';
-          });
-
-          if (validationResult.isValid) {
-            // Write to valid file immediately
-            await validCsvWriter.writeRecords([record]);
-            validCount++;
-          } else {
-            // Write to invalid file with reasons immediately
-            record.Rejection_Reasons = reasons.join('; ');
-            await invalidCsvWriter.writeRecords([record]);
-            invalidCount++;
-          }
-        }
-
-        processedCount++;
-
-        // Log progress and save progress file every batch
-        if (processedCount % batchSize === 0 || processedCount === totalCount) {
-          const progress = {
-            processedCount,
-            totalCount,
-            validCount,
-            invalidCount,
-            percentage: ((processedCount / totalCount) * 100).toFixed(2),
-            elapsedTime: Date.now() - startTime,
-            estimatedTimeRemaining: processedCount > 0 ? 
-              Math.round(((Date.now() - startTime) / processedCount) * (totalCount - processedCount)) : 0,
-            lastUpdated: new Date().toISOString()
-          };
-
-          // Save progress to file
-          fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
-          
-          logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount}`);
-        }
-
-      } catch (error) {
-        // Handle individual email processing errors
-        logger.error(`Error processing email ${i + 1}:`, error);
-        
-        const emailData = csvData[i];
-        const invalidRecord = {};
-        originalColumns.forEach(col => {
-          invalidRecord[col] = emailData[col] || '';
-        });
-        invalidRecord.Rejection_Reasons = `Processing error: ${error.message}`;
-        
-        await invalidCsvWriter.writeRecords([invalidRecord]);
-        invalidCount++;
-        processedCount++;
-      }
-    }
-
-    logger.info(`Sequential processing complete: ${validCount} valid, ${invalidCount} invalid`);
-
-    // Final progress update
-    const finalProgress = {
-      processedCount: totalCount,
-      totalCount,
-      validCount,
-      invalidCount,
-      percentage: 100,
-      elapsedTime: Date.now() - startTime,
-      completed: true,
-      completedAt: new Date().toISOString()
-    };
-    fs.writeFileSync(progressPath, JSON.stringify(finalProgress, null, 2));
-
-    // Send response with download links
+    // Send immediate response with tempId so user can monitor progress
     res.json({
       success: true,
-      message: 'CSV validation completed',
+      message: 'CSV validation started',
       summary: {
-        totalProcessed: processedCount,
-        validEmails: validCount,
-        invalidEmails: invalidCount,
-        processingTime: Date.now() - startTime
+        totalToProcess: totalCount,
+        status: 'processing'
       },
       downloadLinks: {
-        validEmails: validCount > 0 ? `/api/email/download/${path.basename(tempDir)}/valid_emails.csv` : null,
-        invalidEmails: invalidCount > 0 ? `/api/email/download/${path.basename(tempDir)}/invalid_emails.csv` : null,
+        validEmails: `/api/email/download/${path.basename(tempDir)}/valid_emails.csv`,
+        invalidEmails: `/api/email/download/${path.basename(tempDir)}/invalid_emails.csv`,
         progress: `/api/email/download/${path.basename(tempDir)}/progress.json`
       },
+      progressEndpoint: `/api/email/progress/${path.basename(tempDir)}`,
       tempId: path.basename(tempDir)
+    });
+
+    // Process emails asynchronously after sending response
+    setImmediate(async () => {
+      try {
+        // Process emails sequentially
+        for (let i = 0; i < csvData.length; i++) {
+          try {
+            const emailData = csvData[i];
+            const email = emailData.Email;
+            
+            if (!email || typeof email !== 'string') {
+              // Invalid email format - add to invalid file immediately
+              const invalidRecord = {};
+              originalColumns.forEach(col => {
+                invalidRecord[col] = emailData[col] || '';
+              });
+              invalidRecord.Rejection_Reasons = 'Missing or invalid email format';
+              
+              await invalidCsvWriter.writeRecords([invalidRecord]);
+              invalidCount++;
+            } else {
+              // Perform validation (excluding SMTP)
+              const validationResult = await emailVerificationService.verifyEmail(email, {
+                checkDNS: true,
+                checkMX: true,
+                checkSMTP: false, // Exclude SMTP as requested
+                checkCatchAll: true
+              });
+
+              // Extract validation reasons from the result
+              const reasons = [];
+              if (!validationResult.isValid) {
+                if (validationResult.errors && validationResult.errors.length > 0) {
+                  reasons.push(...validationResult.errors);
+                }
+                if (validationResult.checks) {
+                  // Check syntax validation
+                  if (validationResult.checks.syntax && !validationResult.checks.syntax.isValid) {
+                    reasons.push('Invalid email syntax');
+                  }
+                  // Check DNS validation
+                  if (validationResult.checks.dns && !validationResult.checks.dns.isValid) {
+                    reasons.push('Domain does not exist');
+                  }
+                  // Check MX validation
+                  if (validationResult.checks.mx && !validationResult.checks.mx.isValid) {
+                    reasons.push('No mail servers found for domain');
+                  }
+                  // Check disposable email
+                  if (validationResult.checks.disposable && validationResult.checks.disposable.isDisposable) {
+                    reasons.push('Disposable/temporary email address');
+                  }
+                  // Check role account
+                  if (validationResult.checks.role && validationResult.checks.role.isRole) {
+                    reasons.push('Role-based email address');
+                  }
+                }
+                if (reasons.length === 0) {
+                  reasons.push('Email validation failed');
+                }
+              }
+
+              // Prepare record with original columns
+              const record = {};
+              originalColumns.forEach(col => {
+                record[col] = emailData[col] || '';
+              });
+
+              if (validationResult.isValid) {
+                // Write to valid file immediately
+                await validCsvWriter.writeRecords([record]);
+                validCount++;
+              } else {
+                // Write to invalid file with reasons immediately
+                record.Rejection_Reasons = reasons.join('; ');
+                await invalidCsvWriter.writeRecords([record]);
+                invalidCount++;
+              }
+            }
+
+            processedCount++;
+
+            // Log progress and save progress file every batch
+            if (processedCount % batchSize === 0 || processedCount === totalCount) {
+              const progress = {
+                processedCount,
+                totalCount,
+                validCount,
+                invalidCount,
+                percentage: ((processedCount / totalCount) * 100).toFixed(2),
+                elapsedTime: Date.now() - startTime,
+                estimatedTimeRemaining: processedCount > 0 ? 
+                  Math.round(((Date.now() - startTime) / processedCount) * (totalCount - processedCount)) : 0,
+                lastUpdated: new Date().toISOString()
+              };
+
+              // Save progress to file
+              fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
+              
+              logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount}`);
+            }
+
+          } catch (error) {
+            // Handle individual email processing errors
+            logger.error(`Error processing email ${i + 1}:`, error);
+            
+            const emailData = csvData[i];
+            const invalidRecord = {};
+            originalColumns.forEach(col => {
+              invalidRecord[col] = emailData[col] || '';
+            });
+            invalidRecord.Rejection_Reasons = `Processing error: ${error.message}`;
+            
+            await invalidCsvWriter.writeRecords([invalidRecord]);
+            invalidCount++;
+            processedCount++;
+          }
+        }
+
+        logger.info(`Sequential processing complete: ${validCount} valid, ${invalidCount} invalid`);
+
+        // Final progress update
+        const finalProgress = {
+          processedCount: totalCount,
+          totalCount,
+          validCount,
+          invalidCount,
+          percentage: 100,
+          elapsedTime: Date.now() - startTime,
+          completed: true,
+          completedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(progressPath, JSON.stringify(finalProgress, null, 2));
+        
+        logger.info(`CSV validation completed: ${validCount} valid, ${invalidCount} invalid emails`);
+        
+      } catch (error) {
+        logger.error('Background processing failed:', error);
+        
+        // Update progress with error status
+        const errorProgress = {
+          processedCount,
+          totalCount,
+          validCount,
+          invalidCount,
+          percentage: ((processedCount / totalCount) * 100).toFixed(2),
+          elapsedTime: Date.now() - startTime,
+          error: true,
+          errorMessage: error.message,
+          lastUpdated: new Date().toISOString()
+        };
+        fs.writeFileSync(progressPath, JSON.stringify(errorProgress, null, 2));
+      }
     });
 
     // Clean up temp files after 1 hour
