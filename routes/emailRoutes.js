@@ -655,6 +655,15 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
     // Process emails asynchronously after sending response
     setImmediate(async () => {
       let cleanupTimeout;
+      
+      // Domain cache to avoid redundant DNS/MX lookups
+      const domainCache = new Map();
+      const domainStats = {
+        totalDomains: 0,
+        cachedLookups: 0,
+        freshLookups: 0
+      };
+      
       try {
         // Ensure temp directory exists
         if (!fs.existsSync(tempDir)) {
@@ -682,13 +691,67 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
               await invalidCsvWriter.writeRecords([invalidRecord]);
               invalidCount++;
             } else {
-              // Perform validation (excluding SMTP)
-              const validationResult = await emailVerificationService.verifyEmail(email, {
-                checkDNS: true,
-                checkMX: true,
-                checkSMTP: false, // Exclude SMTP as requested
-                checkCatchAll: true
-              });
+              // Extract domain from email for caching
+              const domain = email.split('@')[1]?.toLowerCase();
+              
+              let validationResult;
+              
+              if (domain && domainCache.has(domain)) {
+                // Use cached domain validation result
+                const cachedDomainResult = domainCache.get(domain);
+                domainStats.cachedLookups++;
+                
+                // Perform only syntax validation for the full email, use cached domain data
+                const syntaxResult = await emailVerificationService.syntaxValidator.validate(email);
+                
+                validationResult = {
+                  email: email,
+                  originalEmail: email,
+                  isValid: syntaxResult.isValid && cachedDomainResult.isValid,
+                  quality: syntaxResult.isValid && cachedDomainResult.isValid ? 'high' : 'invalid',
+                  checks: {
+                    syntax: syntaxResult,
+                    dns: cachedDomainResult.dns,
+                    mx: cachedDomainResult.mx,
+                    disposable: cachedDomainResult.disposable,
+                    role: emailVerificationService.roleAccountDetector.getRoleAccountDetails(email.split('@')[0]),
+                    free: cachedDomainResult.free
+                  },
+                  processingTime: 5, // Much faster due to caching
+                  timestamp: new Date().toISOString(),
+                  cached: true
+                };
+                
+                // Update overall validity based on all checks
+                validationResult.isValid = validationResult.checks.syntax.isValid && 
+                                         validationResult.checks.dns.isValid && 
+                                         validationResult.checks.mx.isValid;
+                
+              } else {
+                // Perform full validation and cache domain results
+                validationResult = await emailVerificationService.verifyEmail(email, {
+                  checkDNS: true,
+                  checkMX: true,
+                  checkSMTP: false, // Exclude SMTP as requested
+                  checkCatchAll: true
+                });
+                
+                // Cache domain-level results for future use
+                if (domain && validationResult.checks) {
+                  domainCache.set(domain, {
+                    isValid: validationResult.checks.dns?.isValid && validationResult.checks.mx?.isValid,
+                    dns: validationResult.checks.dns,
+                    mx: validationResult.checks.mx,
+                    disposable: validationResult.checks.disposable,
+                    free: validationResult.checks.free,
+                    cachedAt: new Date().toISOString()
+                  });
+                  domainStats.totalDomains = domainCache.size;
+                  domainStats.freshLookups++;
+                }
+                
+                validationResult.cached = false;
+              }
 
               // Extract validation reasons from the result
               const reasons = [];
@@ -768,7 +831,7 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
               }
               fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
               
-              logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount}`);
+              logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount} - Domains cached: ${domainStats.totalDomains}, Cache hits: ${domainStats.cachedLookups}`);
             }
 
           } catch (error) {
@@ -797,8 +860,9 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
         }
 
         logger.info(`Sequential processing complete: ${validCount} valid, ${invalidCount} invalid`);
+        logger.info(`Domain caching stats: ${domainStats.totalDomains} unique domains, ${domainStats.freshLookups} fresh lookups, ${domainStats.cachedLookups} cached lookups (${((domainStats.cachedLookups / (domainStats.cachedLookups + domainStats.freshLookups)) * 100).toFixed(1)}% cache hit rate)`);
 
-        // Final progress update
+        // Final progress update with caching stats
         const finalProgress = {
           processedCount: totalCount,
           totalCount,
@@ -807,7 +871,14 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
           percentage: 100,
           elapsedTime: Date.now() - startTime,
           completed: true,
-          completedAt: new Date().toISOString()
+          completedAt: new Date().toISOString(),
+          cachingStats: {
+            uniqueDomains: domainStats.totalDomains,
+            freshLookups: domainStats.freshLookups,
+            cachedLookups: domainStats.cachedLookups,
+            cacheHitRate: domainStats.cachedLookups > 0 ? 
+              ((domainStats.cachedLookups / (domainStats.cachedLookups + domainStats.freshLookups)) * 100).toFixed(1) + '%' : '0%'
+          }
         };
         
         // Ensure directory exists before writing final progress
