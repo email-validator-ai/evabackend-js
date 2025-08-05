@@ -654,7 +654,13 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
 
     // Process emails asynchronously after sending response
     setImmediate(async () => {
+      let cleanupTimeout;
       try {
+        // Ensure temp directory exists
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+
         // Process emails sequentially
         for (let i = 0; i < csvData.length; i++) {
           try {
@@ -669,6 +675,10 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
               });
               invalidRecord.Rejection_Reasons = 'Missing or invalid email format';
               
+              // Ensure directory exists before writing
+              if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+              }
               await invalidCsvWriter.writeRecords([invalidRecord]);
               invalidCount++;
             } else {
@@ -719,6 +729,11 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
                 record[col] = emailData[col] || '';
               });
 
+              // Ensure directory exists before writing
+              if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+              }
+
               if (validationResult.isValid) {
                 // Write to valid file immediately
                 await validCsvWriter.writeRecords([record]);
@@ -747,7 +762,10 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
                 lastUpdated: new Date().toISOString()
               };
 
-              // Save progress to file
+              // Ensure directory exists before writing progress
+              if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+              }
               fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2));
               
               logger.info(`Progress: ${processedCount}/${totalCount} (${progress.percentage}%) - Valid: ${validCount}, Invalid: ${invalidCount}`);
@@ -764,7 +782,15 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
             });
             invalidRecord.Rejection_Reasons = `Processing error: ${error.message}`;
             
-            await invalidCsvWriter.writeRecords([invalidRecord]);
+            // Ensure directory exists before writing
+            if (!fs.existsSync(tempDir)) {
+              fs.mkdirSync(tempDir, { recursive: true });
+            }
+            try {
+              await invalidCsvWriter.writeRecords([invalidRecord]);
+            } catch (writeError) {
+              logger.error(`Failed to write error record for email ${i + 1}:`, writeError);
+            }
             invalidCount++;
             processedCount++;
           }
@@ -783,38 +809,68 @@ router.post('/validate-csv', upload.single('csvFile'), async (req, res) => {
           completed: true,
           completedAt: new Date().toISOString()
         };
+        
+        // Ensure directory exists before writing final progress
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
         fs.writeFileSync(progressPath, JSON.stringify(finalProgress, null, 2));
         
         logger.info(`CSV validation completed: ${validCount} valid, ${invalidCount} invalid emails`);
         
+        // Set cleanup timeout AFTER processing is complete
+        cleanupTimeout = setTimeout(() => {
+          try {
+            if (fs.existsSync(tempDir)) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+              logger.info(`Cleaned up temporary files: ${tempDir}`);
+            }
+          } catch (cleanupError) {
+            logger.error('Error cleaning up temp files:', cleanupError);
+          }
+        }, 60 * 60 * 1000); // 1 hour after completion
+        
       } catch (error) {
         logger.error('Background processing failed:', error);
         
-        // Update progress with error status
-        const errorProgress = {
-          processedCount,
-          totalCount,
-          validCount,
-          invalidCount,
-          percentage: ((processedCount / totalCount) * 100).toFixed(2),
-          elapsedTime: Date.now() - startTime,
-          error: true,
-          errorMessage: error.message,
-          lastUpdated: new Date().toISOString()
-        };
-        fs.writeFileSync(progressPath, JSON.stringify(errorProgress, null, 2));
+        try {
+          // Ensure directory exists before writing error progress
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          
+          // Update progress with error status
+          const errorProgress = {
+            processedCount,
+            totalCount,
+            validCount,
+            invalidCount,
+            percentage: ((processedCount / totalCount) * 100).toFixed(2),
+            elapsedTime: Date.now() - startTime,
+            error: true,
+            errorMessage: error.message,
+            lastUpdated: new Date().toISOString()
+          };
+          fs.writeFileSync(progressPath, JSON.stringify(errorProgress, null, 2));
+        } catch (progressError) {
+          logger.error('Failed to write error progress:', progressError);
+        }
+        
+        // Set cleanup timeout even on error
+        cleanupTimeout = setTimeout(() => {
+          try {
+            if (fs.existsSync(tempDir)) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+              logger.info(`Cleaned up temporary files after error: ${tempDir}`);
+            }
+          } catch (cleanupError) {
+            logger.error('Error cleaning up temp files after error:', cleanupError);
+          }
+        }, 60 * 60 * 1000); // 1 hour after error
       }
     });
 
-    // Clean up temp files after 1 hour
-    setTimeout(() => {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        logger.info(`Cleaned up temporary files: ${tempDir}`);
-      } catch (error) {
-        logger.error('Error cleaning up temp files:', error);
-      }
-    }, 60 * 60 * 1000); // 1 hour
+    // Note: Cleanup timeout is now handled after processing completes in the background task
 
   } catch (error) {
     logger.error('CSV validation failed:', error);
